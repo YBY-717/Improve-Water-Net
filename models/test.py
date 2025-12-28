@@ -34,7 +34,7 @@ def gamma_correction(img, gamma=0.7):
     return cv2.LUT(img, table)
 
 
-# --- [新增] 与 Code 1 一致的 Padding 函数 ---
+# --- [新增] Padding 函数 ---
 def pad_to_multiple(x, multiple=16):
     """
     将图像 Tensor 长宽填充到 multiple 的倍数
@@ -59,7 +59,7 @@ def preprocess_image(img_path, max_size=1024):
         print(f"Error: 无法读取 {img_path}")
         return None, None, None, None, None, 0, 0
 
-    # === 1. 检查尺寸并进行安全缩放 (与 Code 1 逻辑一致) ===
+    # === 1. 检查尺寸并进行安全缩放 ===
     h, w = raw_bgr.shape[:2]
     max_dim = max(h, w)
     
@@ -68,7 +68,7 @@ def preprocess_image(img_path, max_size=1024):
         scale = max_size / max_dim
         new_h = int(h * scale)
         new_w = int(w * scale)
-        # 使用 OpenCV 进行缩放 (效果等同于 F.interpolate bilinear)
+        # 使用 OpenCV 进行缩放
         raw_bgr = cv2.resize(raw_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         # 更新当前长宽
         h, w = new_h, new_w
@@ -123,14 +123,36 @@ def run_inference(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # --- 打印当前测试的模型配置 ---
+    print("="*40)
+    print(f"Inference Configuration:")
+    print(f"  Transformer : {not args.no_transformer}")
+    print(f"  CBAM        : {not args.no_cbam}")
+    print(f"  ASPP        : {not args.no_aspp}")
+    print(f"  Checkpoint  : {args.ckpt_path}")
+    print("="*40)
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Loading model from {args.ckpt_path}...")
-    model = ImprovedWaterNet().to(device)
+    # --- [关键修改] 实例化模型时传入开关参数 ---
+    model = ImprovedWaterNet(
+        use_transformer=not args.no_transformer,
+        use_cbam=not args.no_cbam,
+        use_aspp=not args.no_aspp
+    ).to(device)
     
+    print(f"Loading weights from {args.ckpt_path}...")
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
+    
+    # 使用 strict=True 可以确保你的开关参数和加载的权重文件完美匹配
+    # 如果报错 key missing，说明你的命令行参数和训练时的配置不一致
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except Exception as e:
+        print(f"Warning: Strict loading failed ({e}). Trying strict=False...")
+        model.load_state_dict(state_dict, strict=False)
+        
     model.eval()
 
     image_paths = resolve_input_path(args.input_path)
@@ -140,7 +162,7 @@ def run_inference(args):
 
     print(f"Found {len(image_paths)} images to process.")
 
-    # 定义 MAX_SIZE (与 Code 1 一致)
+    # 定义 MAX_SIZE
     MAX_SIZE = 1024
 
     with torch.no_grad():
@@ -148,7 +170,6 @@ def run_inference(args):
             fname = os.path.basename(img_path)
 
             # 预处理 (内部已包含 Resize 逻辑)
-            # h, w 是经过 Resize (如果需要) 后的实际尺寸
             raw, wb, ce, gc, h, w = preprocess_image(img_path, max_size=MAX_SIZE)
             
             if raw is None: continue
@@ -159,7 +180,6 @@ def run_inference(args):
             gc = gc.to(device)
 
             # === 2. 自动 Padding (适配网络下采样) ===
-            # 对所有输入做同样的 Padding
             raw_padded = pad_to_multiple(raw, multiple=16)
             wb_padded = pad_to_multiple(wb, multiple=16)
             ce_padded = pad_to_multiple(ce, multiple=16)
@@ -169,7 +189,6 @@ def run_inference(args):
             output = model(raw_padded, wb_padded, ce_padded, gc_padded)
 
             # === 3. 裁剪回有效尺寸 (Crop) ===
-            # 去掉 Padding，得到 (h, w) 大小的图
             # 注意：这里的 output 尺寸是缩放后的尺寸 (如果触发了 MAX_SIZE)
             output = output[:, :, :h, :w]
 
@@ -181,16 +200,22 @@ def run_inference(args):
             save_path = os.path.join(args.output_dir, fname)
             cv2.imwrite(save_path, out_img)
 
-            print(f"[{i + 1}/{len(image_paths)}] Processed: {fname} | Size: {w}x{h}")
+            if (i + 1) % 10 == 0:
+                print(f"[{i + 1}/{len(image_paths)}] Processed: {fname} | Size: {w}x{h}")
 
     print(f"Done! Results saved to {args.output_dir}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ImprovedWaterNet Inference')
-    parser.add_argument('--input_path', type=str, default='DATA_UIEB_mine/challenging', help='Dataset root or path to images')
-    parser.add_argument('--ckpt_path', type=str, default='checkpoints/ImprovedWaterNet_best.pth', help='Path to .pth file')
-    parser.add_argument('--output_dir', type=str, default='result_image_C60', help='Folder to save results')
+    parser.add_argument('--input_path', type=str, default='DATA_UIEB_mine/test/raw', help='Dataset root or path to images')
+    parser.add_argument('--ckpt_path', type=str, default='checkpoints/NoTrans_best.pth', help='Path to .pth file')
+    parser.add_argument('--output_dir', type=str, default='result_NoTrans_UIEB', help='Folder to save results')
+    
+    parser.add_argument('--no_transformer', action='store_true', help='Disable Transformer Module')
+    parser.add_argument('--no_cbam', action='store_true', help='Disable CBAM Module')
+    parser.add_argument('--no_aspp', action='store_true', help='Disable ASPP Module')
+    
     args = parser.parse_args()
     
     run_inference(args)
