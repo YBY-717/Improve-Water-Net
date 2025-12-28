@@ -126,8 +126,19 @@ class TransformerBottleneck(nn.Module):
 
 # Improved WaterNet
 class ImprovedWaterNet(nn.Module):
-    def __init__(self):
+    def __init__(self, use_transformer=True, use_cbam=True, use_aspp=True):
+        """
+        Args:
+            use_transformer (bool): 是否使用 Transformer Bottleneck
+            use_cbam (bool): 是否使用 CBAM 注意力
+            use_aspp (bool): 是否使用 ASPP (False 则退化为普通卷积)
+        """
         super(ImprovedWaterNet, self).__init__()
+
+        # 保存配置开关
+        self.use_transformer = use_transformer
+        self.use_cbam = use_cbam
+        self.use_aspp = use_aspp
 
         # --- Main Branch (Confidence Map Generator) ---
         self.main_conv1 = nn.Conv2d(12, 128, 7, 1, 3)
@@ -135,76 +146,84 @@ class ImprovedWaterNet(nn.Module):
         self.main_conv3 = nn.Conv2d(128, 128, 3, 1, 1)
         self.main_conv4 = nn.Conv2d(128, 64, 1, 1, 0)
 
-        # [改进点1]: Transformer 用于捕获长距离依赖
-        self.transformer = TransformerBottleneck(in_channels=64)
+        # [改进点1]: Transformer 开关
+        if self.use_transformer:
+            self.transformer = TransformerBottleneck(in_channels=64)
 
-        # [改进点2]: CBAM 移至此处 (Feature Backend)
-        # 此时输入是经过 Conv 和 Transformer 处理后的 64 通道深层特征
-        # 它可以精确地对 "哪些特征决定了权重分配" 进行注意力加权
-        self.cbam = CBAM(in_planes=64)
+        # [改进点2]: CBAM 开关
+        if self.use_cbam:
+            self.cbam = CBAM(in_planes=64)
 
         self.main_conv5 = nn.Conv2d(64, 64, 7, 1, 3)
         self.main_conv6 = nn.Conv2d(64, 64, 5, 1, 2)
         self.main_conv7 = nn.Conv2d(64, 64, 3, 1, 1)
-        self.main_conv8 = nn.Conv2d(64, 3, 3, 1, 1)  # 输出最终权重 (3通道)
+        self.main_conv8 = nn.Conv2d(64, 3, 3, 1, 1)
 
-        # --- Refinement Branches (with ASPP) ---
-        # WB Branch
+        # --- Refinement Branches ---
         self.wb_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
-        self.wb_aspp = ASPP(32, 32)
-        self.wb_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
-
-        # CE Branch (对应原图的 HE/FTU)
         self.ce_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
-        self.ce_aspp = ASPP(32, 32)
-        self.ce_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
-
-        # GC Branch
         self.gc_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
-        self.gc_aspp = ASPP(32, 32)
+
+        # [改进点3]: ASPP 开关 (如果不用ASPP，用普通卷积替代以保持通道一致)
+        if self.use_aspp:
+            self.wb_refine = ASPP(32, 32)
+            self.ce_refine = ASPP(32, 32)
+            self.gc_refine = ASPP(32, 32)
+        else:
+            # Baseline: 使用普通 3x3 卷积代替 ASPP
+            self.wb_refine = nn.Conv2d(32, 32, 3, 1, 1)
+            self.ce_refine = nn.Conv2d(32, 32, 3, 1, 1)
+            self.gc_refine = nn.Conv2d(32, 32, 3, 1, 1)
+
+        self.wb_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
+        self.ce_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
         self.gc_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
 
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, raw, wb, ce, gc):
-        # 1. Main Branch: 生成权重图
-        cat_main = torch.cat([raw, wb, ce, gc], dim=1)  # [B, 12, H, W]
+        # 1. Main Branch
+        cat_main = torch.cat([raw, wb, ce, gc], dim=1)
 
-        # 早期卷积特征提取
         m = self.relu(self.main_conv1(cat_main))
         m = self.relu(self.main_conv2(m))
         m = self.relu(self.main_conv3(m))
-        m = self.relu(self.main_conv4(m))  # [B, 64, H, W]
+        m = self.relu(self.main_conv4(m))
 
-        # [核心改进流]: Features -> Transformer -> CBAM -> Weights
-        m = self.transformer(m)  # Global Context
-        m = self.cbam(m)  # Feature Refinement (Attention)
+        # 逻辑判断：如果启用才执行
+        if self.use_transformer:
+            m = self.transformer(m)
+
+        if self.use_cbam:
+            m = self.cbam(m)
 
         m = self.relu(self.main_conv5(m))
         m = self.relu(self.main_conv6(m))
         m = self.relu(self.main_conv7(m))
 
-        weights = self.sigmoid(self.main_conv8(m))  # [B, 3, H, W]
+        weights = self.sigmoid(self.main_conv8(m))
         w_wb, w_ce, w_gc = torch.split(weights, 1, dim=1)
 
-        # 2. Refinement Branches (with ASPP)
+        # 2. Refinement Branches
+        # 这里的 self.wb_refine 会根据 init 自动变成 ASPP 或 Conv2d，代码无需变动
+
         # WB
         cat_wb = torch.cat([raw, wb], dim=1)
         r_wb = self.relu(self.wb_conv1(cat_wb))
-        r_wb = self.wb_aspp(r_wb)
+        r_wb = self.wb_refine(r_wb)
         r_wb = self.relu(self.wb_conv3(r_wb))
 
         # CE
         cat_ce = torch.cat([raw, ce], dim=1)
         r_ce = self.relu(self.ce_conv1(cat_ce))
-        r_ce = self.ce_aspp(r_ce)
+        r_ce = self.ce_refine(r_ce)
         r_ce = self.relu(self.ce_conv3(r_ce))
 
         # GC
         cat_gc = torch.cat([raw, gc], dim=1)
         r_gc = self.relu(self.gc_conv1(cat_gc))
-        r_gc = self.gc_aspp(r_gc)
+        r_gc = self.gc_refine(r_gc)
         r_gc = self.relu(self.gc_conv3(r_gc))
 
         # 3. Fusion
