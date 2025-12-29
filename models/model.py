@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# CBAM Module
+# --- 基础组件定义 ---
+
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
@@ -48,9 +49,6 @@ class CBAM(nn.Module):
         return out
 
 
-
-# ASPP Module
-
 class ASPP(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ASPP, self).__init__()
@@ -81,12 +79,11 @@ class ASPP(nn.Module):
         return self.relu(x)
 
 
-# Transformer Module (保持不变)
 class TransformerBottleneck(nn.Module):
     def __init__(self, in_channels, num_heads=4, dim_feedforward=512, downsample_size=(32, 32)):
         super(TransformerBottleneck, self).__init__()
         self.in_channels = in_channels
-        self.downsample_size = downsample_size  # 目标缩放尺寸，32x32 非常足够了
+        self.downsample_size = downsample_size
 
         self.encoder_layer = nn.TransformerEncoderLayer(
             d_model=in_channels,
@@ -97,60 +94,41 @@ class TransformerBottleneck(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
 
     def forward(self, x):
-        # x shape: [B, C, H, W] (例如 256x256)
         b, c, h, w = x.shape
-
-        # 1. Downsample (下采样)
-        # 将 256x256 -> 32x32。序列长度从 65536 降为 1024。
         x_down = F.adaptive_avg_pool2d(x, self.downsample_size)
-
-        # 2. Flatten for Transformer
-        # [B, C, 32, 32] -> [B, C, 1024] -> [B, 1024, C]
         x_flatten = x_down.flatten(2).transpose(1, 2)
-
-        # 3. Transformer Processing
         x_trans = self.transformer_encoder(x_flatten)
-
-        # 4. Reshape back
-        # [B, 1024, C] -> [B, C, 1024] -> [B, C, 32, 32]
         x_trans = x_trans.transpose(1, 2).reshape(b, c, self.downsample_size[0], self.downsample_size[1])
-
-        # 5. Upsample (上采样) 恢复回原始尺寸
-        # 使用双线性插值恢复到 [B, C, H, W]
         out = F.interpolate(x_trans, size=(h, w), mode='bilinear', align_corners=True)
-
-        # 6. Residual Connection (残差连接)
         return x + out
 
 
+# --- 主模型定义 ---
 
-# Improved WaterNet
 class ImprovedWaterNet(nn.Module):
     def __init__(self, use_transformer=True, use_cbam=True, use_aspp=True):
         """
         Args:
-            use_transformer (bool): 是否使用 Transformer Bottleneck
-            use_cbam (bool): 是否使用 CBAM 注意力
-            use_aspp (bool): 是否使用 ASPP (False 则退化为普通卷积)
+            use_transformer (bool): 是否启用 Transformer (全局感知)
+            use_cbam (bool): 是否启用 CBAM (局部精炼)
+            use_aspp (bool): 是否启用 ASPP (多尺度细化)
         """
         super(ImprovedWaterNet, self).__init__()
-
-        # 保存配置开关
+        
         self.use_transformer = use_transformer
         self.use_cbam = use_cbam
         self.use_aspp = use_aspp
 
-        # --- Main Branch (Confidence Map Generator) ---
+        # --- Main Branch (置信度生成分支) ---
         self.main_conv1 = nn.Conv2d(12, 128, 7, 1, 3)
         self.main_conv2 = nn.Conv2d(128, 128, 5, 1, 2)
         self.main_conv3 = nn.Conv2d(128, 128, 3, 1, 1)
         self.main_conv4 = nn.Conv2d(128, 64, 1, 1, 0)
 
-        # [改进点1]: Transformer 开关
+        # [模块 1]: 全局-局部联合感知模块
         if self.use_transformer:
             self.transformer = TransformerBottleneck(in_channels=64)
-
-        # [改进点2]: CBAM 开关
+        
         if self.use_cbam:
             self.cbam = CBAM(in_planes=64)
 
@@ -159,18 +137,17 @@ class ImprovedWaterNet(nn.Module):
         self.main_conv7 = nn.Conv2d(64, 64, 3, 1, 1)
         self.main_conv8 = nn.Conv2d(64, 3, 3, 1, 1)
 
-        # --- Refinement Branches ---
+        # --- Refinement Branches (细化分支) ---
         self.wb_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
         self.ce_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
         self.gc_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
 
-        # [改进点3]: ASPP 开关 (如果不用ASPP，用普通卷积替代以保持通道一致)
+        # [模块 2]: 多尺度特征细化
         if self.use_aspp:
             self.wb_refine = ASPP(32, 32)
             self.ce_refine = ASPP(32, 32)
             self.gc_refine = ASPP(32, 32)
         else:
-            # Baseline: 使用普通 3x3 卷积代替 ASPP
             self.wb_refine = nn.Conv2d(32, 32, 3, 1, 1)
             self.ce_refine = nn.Conv2d(32, 32, 3, 1, 1)
             self.gc_refine = nn.Conv2d(32, 32, 3, 1, 1)
@@ -185,18 +162,19 @@ class ImprovedWaterNet(nn.Module):
     def forward(self, raw, wb, ce, gc):
         # 1. Main Branch
         cat_main = torch.cat([raw, wb, ce, gc], dim=1)
-
+        
         m = self.relu(self.main_conv1(cat_main))
         m = self.relu(self.main_conv2(m))
         m = self.relu(self.main_conv3(m))
         m = self.relu(self.main_conv4(m))
 
-        # 逻辑判断：如果启用才执行
+        # --- 执行联合感知模块 ---
         if self.use_transformer:
             m = self.transformer(m)
-
+        
         if self.use_cbam:
             m = self.cbam(m)
+        # -----------------------
 
         m = self.relu(self.main_conv5(m))
         m = self.relu(self.main_conv6(m))
@@ -206,12 +184,10 @@ class ImprovedWaterNet(nn.Module):
         w_wb, w_ce, w_gc = torch.split(weights, 1, dim=1)
 
         # 2. Refinement Branches
-        # 这里的 self.wb_refine 会根据 init 自动变成 ASPP 或 Conv2d，代码无需变动
-
         # WB
         cat_wb = torch.cat([raw, wb], dim=1)
         r_wb = self.relu(self.wb_conv1(cat_wb))
-        r_wb = self.wb_refine(r_wb)
+        r_wb = self.wb_refine(r_wb) 
         r_wb = self.relu(self.wb_conv3(r_wb))
 
         # CE
@@ -231,10 +207,7 @@ class ImprovedWaterNet(nn.Module):
 
         return out
 
-
 if __name__ == '__main__':
     model = ImprovedWaterNet()
-    dummy_input = torch.randn(1, 3, 256, 256)
-    output = model(dummy_input, dummy_input, dummy_input, dummy_input)
-    print("Output shape:", output.shape)
-    print("CBAM successfully moved to backend.")
+    dummy = torch.randn(1, 3, 256, 256)
+    print("Model initialized successfully.")
