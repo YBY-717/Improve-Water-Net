@@ -33,32 +33,22 @@ class PerceptualLoss(torch.nn.Module):
         return torch.mean((pred_feat - gt_feat) ** 2)
 
 
-# --- 2. 定义验证函数 (已移除 PSNR) ---
+# --- 2. 定义验证函数 ---
 def validate(model, val_loader, criterion_l1, criterion_vgg, device, texture_weight):
-    """
-    运行验证集评估，仅计算 Loss
-    """
-    model.eval()  # 切换到评估模式
+    model.eval()
     total_val_loss = 0
     num_batches = len(val_loader)
 
-    with torch.no_grad():  # 不计算梯度
+    with torch.no_grad():
         for raw, wb, ce, gc, gt, _ in val_loader:
-            raw = raw.to(device)
-            wb = wb.to(device)
-            ce = ce.to(device)
-            gc = gc.to(device)
-            gt = gt.to(device)
-
-            # Forward
+            raw, wb, ce, gc, gt = raw.to(device), wb.to(device), ce.to(device), gc.to(device), gt.to(device)
+            
             output = model(raw, wb, ce, gc)
-
-            # --- 修改为 ---
-            loss_pixel = criterion_l1(output, gt)  # gt 本身就是 0-1
+            
+            loss_pixel = criterion_l1(output, gt)
             out_01 = torch.clamp(output, 0, 1)
-            out_01 = torch.clamp(out_01, 0, 1)
             loss_texture = criterion_vgg(out_01, gt)
-
+            
             loss = loss_pixel + texture_weight * loss_texture
             total_val_loss += loss.item()
 
@@ -68,61 +58,67 @@ def validate(model, val_loader, criterion_l1, criterion_vgg, device, texture_wei
 
 def parse_args():
     parser = argparse.ArgumentParser(description='ImprovedWaterNet Training & Ablation')
+    
+    # [关键] 消融实验开关
+    parser.add_argument('--no_perception', action='store_true', 
+                        help='Ablation: Disable Global-Local Perception Module (Trans + CBAM)')
+    parser.add_argument('--no_aspp', action='store_true', 
+                        help='Ablation: Disable ASPP Module')
 
-    # --- 消融实验控制开关 (默认为不禁用，即全开启) ---
-    parser.add_argument('--no_transformer', action='store_true', help='Disable Transformer Module')
-    parser.add_argument('--no_cbam', action='store_true', help='Disable CBAM Module')
-    parser.add_argument('--no_aspp', action='store_true', help='Disable ASPP Module (use Conv3x3 instead)')
-
-    # ... (保留原有的其他参数: batch_size, epochs, lr 等) ...
-    parser.add_argument('-b', '--batch_size', type=int, default=24, help='batch size')
+    parser.add_argument('-b', '--batch_size', type=int, default=16, help='batch size')
     parser.add_argument('-e', '--epochs', type=int, default=100, help='number of epochs')
     parser.add_argument('-lr', '--lr', type=float, default=1e-4, help='initial learning rate')
-    parser.add_argument('--beta1', type=float, default=0.9, help='beta1 for Adam')
-    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
-    parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
-    parser.add_argument('--texture_weight', type=float, default=0.05, help='weight for texture loss')
-    parser.add_argument('--min_lr', type=float, default=1e-6, help='minimum lr')
     parser.add_argument('--data_dir', type=str, default='data_UIEB', help='dataset directory')
-    parser.add_argument('--image_size', type=int, default=256, help='input image size')
-    parser.add_argument('--num_workers', type=int, default=4, help='number of workers')
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='save directory')
-    parser.add_argument('--resume', type=str, default=None, help='path to checkpoint')
-    parser.add_argument('--resume_best', action='store_true', help='resume from best models')
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
-    parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--texture_weight', type=float, default=0.05)
+    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.999)
+    parser.add_argument('--weight_decay', type=float, default=0)
+    parser.add_argument('--image_size', type=int, default=256)
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--resume_best', action='store_true')
 
     return parser.parse_args()
 
 
 def train(args):
-    # ... (Seed 和 Device 设置保持不变) ...
+    # [关键修复] 禁用 cuDNN benchmark 以防止 CUDNN_STATUS_NOT_SUPPORTED 错误
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    print(">> Note: cuDNN benchmark disabled to ensure stability.")
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available() and args.device == 'cuda':
         torch.cuda.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
 
-    # --- 1. 生成实验名称 (用于区分保存的文件) ---
-    # 逻辑: 如果是 Full 模型，名字叫 "Full"；否则标出缺少的模块
-    exp_name_parts = []
-    if args.no_transformer: exp_name_parts.append("NoTrans")
-    if args.no_cbam: exp_name_parts.append("NoCBAM")
-    if args.no_aspp: exp_name_parts.append("NoASPP")
+    # --- 1. 确定模型配置与实验名称 ---
+    use_transformer = True
+    use_cbam = True
+    use_aspp = True
+    exp_name = "Full_Model"
 
-    if len(exp_name_parts) == 0:
-        exp_name = "Full_Model"
-    else:
-        exp_name = "_".join(exp_name_parts)
+    if args.no_perception:
+        use_transformer = False
+        use_cbam = False
+        exp_name = "NoPerception" # 对应论文中的“去除感知模块”
+    
+    if args.no_aspp:
+        use_aspp = False
+        exp_name = "NoASPP"
 
     print(f"==========================================")
     print(f"Running Experiment: {exp_name}")
-    print(f"Transformer: {not args.no_transformer} | CBAM: {not args.no_cbam} | ASPP: {not args.no_aspp}")
+    print(f"Config -> Trans: {use_transformer} | CBAM: {use_cbam} | ASPP: {use_aspp}")
     print(f"==========================================")
-
+    
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # ... (Dataset 和 DataLoader 部分保持不变) ...
-    print("Loading Training Set...")
+    print("Loading Dataset...")
     train_dataset = WaterDataset(args.data_dir, split='train', image_size=(args.image_size, args.image_size))
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                               pin_memory=True, drop_last=True)
@@ -130,11 +126,11 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
                             pin_memory=True)
 
-    # --- 2. 实例化模型 (传入参数) ---
+    # --- 2. 实例化模型 ---
     model = ImprovedWaterNet(
-        use_transformer=not args.no_transformer,
-        use_cbam=not args.no_cbam,
-        use_aspp=not args.no_aspp
+        use_transformer=use_transformer,
+        use_cbam=use_cbam,
+        use_aspp=use_aspp
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
@@ -144,13 +140,13 @@ def train(args):
     criterion_l1 = torch.nn.L1Loss()
     criterion_vgg = PerceptualLoss(device)
 
-    # --- 3. Resume 逻辑 (更新文件名) ---
+    # --- 3. Resume 逻辑 ---
     best_val_loss = float('inf')
     start_epoch = 0
-
-    # 自动定义文件名
-    best_model_name = f'ImprovedWaterNet_{exp_name}_best.pth'
-    recent_model_name = f'ImprovedWaterNet_{exp_name}_recent.pth'
+    
+    # 动态定义文件名
+    best_model_name = f'{exp_name}_best.pth'
+    recent_model_name = f'{exp_name}_recent.pth'
 
     if args.resume:
         checkpoint_path = args.resume
@@ -162,7 +158,6 @@ def train(args):
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        # 这里要加 strict=False，以防你在不同实验间切换加载权重导致 key 不匹配报错
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('epoch', 0)
@@ -170,7 +165,7 @@ def train(args):
         scheduler.last_epoch = start_epoch - 1
         print(f"Resumed from epoch {start_epoch}, best loss: {best_val_loss:.4f}")
 
-    # ... (Training Loop 保持不变) ...
+    # --- 4. 训练循环 ---
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_train_loss = 0
@@ -190,8 +185,7 @@ def train(args):
             epoch_train_loss += loss.item()
 
             if i % 10 == 0:
-                print(
-                    f"[Train] Epoch [{epoch + 1}/{args.epochs}], Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                print(f"[Train] Epoch [{epoch + 1}/{args.epochs}], Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
 
         scheduler.step()
         avg_train_loss = epoch_train_loss / len(train_loader)
@@ -203,7 +197,7 @@ def train(args):
         print(f"  Train Loss: {avg_train_loss:.4f}")
         print(f"  Val Loss:   {avg_val_loss:.4f}")
 
-        # --- 保存逻辑 (使用动态文件名) ---
+        # 保存 Recent
         recent_path = os.path.join(args.save_dir, recent_model_name)
         torch.save({
             'epoch': epoch + 1,
@@ -214,6 +208,7 @@ def train(args):
             'args': vars(args)
         }, recent_path)
 
+        # 保存 Best
         if avg_val_loss < best_val_loss:
             print(f"Validation Loss improved. Saving to {best_model_name}...")
             best_val_loss = avg_val_loss
