@@ -58,12 +58,6 @@ def validate(model, val_loader, criterion_l1, criterion_vgg, device, texture_wei
 
 def parse_args():
     parser = argparse.ArgumentParser(description='ImprovedWaterNet Training & Ablation')
-    
-    # [关键] 消融实验开关
-    parser.add_argument('--no_perception', action='store_true', 
-                        help='Ablation: Disable Global-Local Perception Module (Trans + CBAM)')
-    parser.add_argument('--no_aspp', action='store_true', 
-                        help='Ablation: Disable ASPP Module')
 
     parser.add_argument('-b', '--batch_size', type=int, default=16, help='batch size')
     parser.add_argument('-e', '--epochs', type=int, default=100, help='number of epochs')
@@ -127,11 +121,7 @@ def train(args):
                             pin_memory=True)
 
     # --- 2. 实例化模型 ---
-    model = ImprovedWaterNet(
-        use_transformer=use_transformer,
-        use_cbam=use_cbam,
-        use_aspp=use_aspp
-    ).to(device)
+    model = ImprovedWaterNet().to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
                            weight_decay=args.weight_decay)
