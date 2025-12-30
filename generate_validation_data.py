@@ -101,11 +101,11 @@ def process_test_simple(raw_folder, gt_folder, output_base='./'):
 # 使用示例
 if __name__ == "__main__":
     # 输入路径
-    raw_folder = "/root/autodl-tmp/Water-Net_Code-master/DATA_LSUI_mine/val/raw"
-    gt_folder = "/root/autodl-tmp/Water-Net_Code-master/DATA_LSUI_mine/val/gt"
+    raw_folder = "/Water-Net_Code-master/DATA_UIEB_mine/val/raw"
+    gt_folder = "/Water-Net_Code-master/DATA_UIEB_mine/val/gt"
 
     # --- 这里指定你想保存的路径 ---
-    output_dir = "/root/autodl-tmp/Water-Net_Code-master/data_LSUI/val"
+    output_dir = "/Water-Net_Code-master/data_UIEB/val"
 
     # 调用函数时传入 output_dir
     process_test_simple(raw_folder, gt_folder, output_base=output_dir)
@@ -113,4 +113,5 @@ if __name__ == "__main__":
 # raw_folder填入验证集原始图片
 # gt_folder填入验证集参考图片
 # output_dir填入想保存的路径
+
 # 执行后会在指定路径文件夹下生成相应的input_ce_val、input_gc_val、input_wb_val、input_val、gt_val图片
