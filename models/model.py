@@ -135,10 +135,8 @@ class ImprovedWaterNet(nn.Module):
         self.main_conv3 = nn.Conv2d(128, 128, 3, 1, 1)
         self.main_conv4 = nn.Conv2d(128, 64, 1, 1, 0)
 
-        # [改进点1]: Transformer 用于捕获长距离依赖
         self.transformer = TransformerBottleneck(in_channels=64)
 
-        # [改进点2]: CBAM 移至此处 (Feature Backend)
         # 此时输入是经过 Conv 和 Transformer 处理后的 64 通道深层特征
         # 它可以精确地对 "哪些特征决定了权重分配" 进行注意力加权
         self.cbam = CBAM(in_planes=64)
@@ -177,7 +175,6 @@ class ImprovedWaterNet(nn.Module):
         m = self.relu(self.main_conv3(m))
         m = self.relu(self.main_conv4(m))  # [B, 64, H, W]
 
-        # [核心改进流]: Features -> Transformer -> CBAM -> Weights
         m = self.transformer(m)  # Global Context
         m = self.cbam(m)  # Feature Refinement (Attention)
 
@@ -219,3 +216,4 @@ if __name__ == '__main__':
     output = model(dummy_input, dummy_input, dummy_input, dummy_input)
     print("Output shape:", output.shape)
     print("CBAM successfully moved to backend.")
+
