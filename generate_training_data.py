@@ -184,8 +184,8 @@ def process_images_fixed(raw_folder, gt_folder, output_base='./'):
 
 if __name__ == "__main__":
     # 配置路径 - 请根据实际情况修改
-    raw_folder = "/root/autodl-tmp/Water-Net_Code-master/DATA_LSUI_mine/train/raw"
-    gt_folder = "/root/autodl-tmp/Water-Net_Code-master/DATA_LSUI_mine/train/gt"
+    raw_folder = "/Water-Net_Code-master/DATA_UIEB_mine/train/raw"
+    gt_folder = "/Water-Net_Code-master/DATA_UIEB_mine/train/gt"
 
     # 验证路径是否正确
     print(f"当前工作目录: {os.getcwd()}")
@@ -194,10 +194,11 @@ if __name__ == "__main__":
 
     # 处理图像
     # 指定你想要的输出路径
-    output_path = "/root/autodl-tmp/Water-Net_Code-master/data_LSUI/train"
+    output_path = "/Water-Net_Code-master/data_UIEB/train"
     process_images_fixed(raw_folder, gt_folder, output_base=output_path)
 
 # raw_folder填入训练集原始图片
 # gt_folder填入训练集参考图片
 # output_path填入想保存的路径
+
 # 执行后会在指定路径文件夹下生成相应的input_ce_train、input_gc_train、input_wb_train、input_train、gt_train图片
