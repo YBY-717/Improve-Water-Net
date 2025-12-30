@@ -1,213 +1,175 @@
+import os
+import argparse
+import cv2
+import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from model import ImprovedWaterNet
 
 
-# --- 基础组件定义 ---
+# --- 1. 自动预处理算法 (保持不变) ---
+def white_balance(img):
+    b, g, r = cv2.split(img)
+    m, n = b.shape
+    avg_b = np.mean(b); avg_g = np.mean(g); avg_r = np.mean(r)
+    avg_b = 1 if avg_b == 0 else avg_b
+    avg_g = 1 if avg_g == 0 else avg_g
+    avg_r = 1 if avg_r == 0 else avg_r
+    avg_gray = (avg_b + avg_g + avg_r) / 3
+    scale_b = avg_gray / avg_b; scale_g = avg_gray / avg_g; scale_r = avg_gray / avg_r
+    b = np.clip(b * scale_b, 0, 255).astype(np.uint8)
+    g = np.clip(g * scale_g, 0, 255).astype(np.uint8)
+    r = np.clip(r * scale_r, 0, 255).astype(np.uint8)
+    return cv2.merge([b, g, r])
 
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+def histogram_equalization(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    v = cv2.equalizeHist(v)
+    hsv = cv2.merge([h, s, v])
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
+def gamma_correction(img, gamma=0.7):
+    table = np.array([((i / 255.0) ** gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(img, table)
 
 
-class CBAM(nn.Module):
-    def __init__(self, in_planes, ratio=16, kernel_size=7):
-        super(CBAM, self).__init__()
-        self.ca = ChannelAttention(in_planes, ratio)
-        self.sa = SpatialAttention(kernel_size)
-
-    def forward(self, x):
-        out = x * self.ca(x)
-        out = out * self.sa(out)
-        return out
-
-
-class ASPP(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ASPP, self).__init__()
-        dilations = [1, 6, 12, 18]
-        self.aspp1 = nn.Conv2d(in_channels, out_channels, 1, 1, padding=0, dilation=dilations[0], bias=False)
-        self.aspp2 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=dilations[1], dilation=dilations[1], bias=False)
-        self.aspp3 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=dilations[2], dilation=dilations[2], bias=False)
-        self.aspp4 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=dilations[3], dilation=dilations[3], bias=False)
-
-        self.global_avg_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Conv2d(in_channels, out_channels, 1, stride=1, bias=False)
-        )
-        self.conv1 = nn.Conv2d(out_channels * 5, out_channels, 1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x1 = self.aspp1(x)
-        x2 = self.aspp2(x)
-        x3 = self.aspp3(x)
-        x4 = self.aspp4(x)
-        x5 = self.global_avg_pool(x)
-        x5 = F.interpolate(x5, size=x4.size()[2:], mode='bilinear', align_corners=True)
-        x = torch.cat((x1, x2, x3, x4, x5), dim=1)
-        x = self.conv1(x)
-        x = self.bn(x)
-        return self.relu(x)
+# --- Padding 函数 ---
+def pad_to_multiple(x, multiple=16):
+    h, w = x.shape[2], x.shape[3]
+    new_h = (h // multiple + 1) * multiple if h % multiple != 0 else h
+    new_w = (w // multiple + 1) * multiple if w % multiple != 0 else w
+    
+    pad_h = new_h - h
+    pad_w = new_w - w
+    
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+    return x
 
 
-class TransformerBottleneck(nn.Module):
-    def __init__(self, in_channels, num_heads=4, dim_feedforward=512, downsample_size=(32, 32)):
-        super(TransformerBottleneck, self).__init__()
-        self.in_channels = in_channels
-        self.downsample_size = downsample_size
+# --- 预处理函数 ---
+def preprocess_image(img_path, max_size=1024):
+    raw_bgr = cv2.imread(img_path)
+    if raw_bgr is None:
+        print(f"Error: 无法读取 {img_path}")
+        return None, None, None, None, None, 0, 0
 
-        self.encoder_layer = nn.TransformerEncoderLayer(
-            d_model=in_channels,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
+    h, w = raw_bgr.shape[:2]
+    max_dim = max(h, w)
+    
+    if max_dim > max_size:
+        scale = max_size / max_dim
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        raw_bgr = cv2.resize(raw_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        h, w = new_h, new_w
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        x_down = F.adaptive_avg_pool2d(x, self.downsample_size)
-        x_flatten = x_down.flatten(2).transpose(1, 2)
-        x_trans = self.transformer_encoder(x_flatten)
-        x_trans = x_trans.transpose(1, 2).reshape(b, c, self.downsample_size[0], self.downsample_size[1])
-        out = F.interpolate(x_trans, size=(h, w), mode='bilinear', align_corners=True)
-        return x + out
+    wb_bgr = white_balance(raw_bgr)
+    ce_bgr = histogram_equalization(raw_bgr)
+    gc_bgr = gamma_correction(raw_bgr, gamma=0.7)
+
+    raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
+    wb_rgb = cv2.cvtColor(wb_bgr, cv2.COLOR_BGR2RGB)
+    ce_rgb = cv2.cvtColor(ce_bgr, cv2.COLOR_BGR2RGB)
+    gc_rgb = cv2.cvtColor(gc_bgr, cv2.COLOR_BGR2RGB)
+
+    def to_tensor(img):
+        img = img.astype(np.float32) / 255.0
+        return torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
+
+    t_raw = to_tensor(raw_rgb)
+    t_wb = to_tensor(wb_rgb)
+    t_ce = to_tensor(ce_rgb)
+    t_gc = to_tensor(gc_rgb)
+
+    return t_raw, t_wb, t_ce, t_gc, h, w
 
 
-# --- 主模型定义 ---
+# --- 智能路径解析函数 ---
+def resolve_input_path(input_arg):
+    if os.path.isfile(input_arg): return [input_arg]
+    candidates = [
+        os.path.join(input_arg, "test", "test_real"),
+        os.path.join(input_arg, "test_real"),
+        os.path.join(input_arg, "test", "input_test"),
+        input_arg
+    ]
+    target_dir = input_arg
+    for p in candidates:
+        if os.path.exists(p) and os.path.isdir(p):
+            files = os.listdir(p)
+            if any(f.lower().endswith(('.jpg', '.png', '.jpeg', '.bmp')) for f in files):
+                target_dir = p
+                break
+    print(f"Auto-detected image directory: {target_dir}")
+    extensions = ('.jpg', '.jpeg', '.png', '.bmp')
+    return [os.path.join(target_dir, f) for f in sorted(os.listdir(target_dir)) if f.lower().endswith(extensions)]
 
-class ImprovedWaterNet(nn.Module):
-    def __init__(self, use_transformer=True, use_cbam=True, use_aspp=True):
-        """
-        Args:
-            use_transformer (bool): 是否启用 Transformer (全局感知)
-            use_cbam (bool): 是否启用 CBAM (局部精炼)
-            use_aspp (bool): 是否启用 ASPP (多尺度细化)
-        """
-        super(ImprovedWaterNet, self).__init__()
+
+# --- 主推断逻辑 ---
+def run_inference(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # --- 2. 实例化模型 ---
+    model = ImprovedWaterNet().to(device)
+    
+    print(f"Loading weights from {args.ckpt_path}...")
+    checkpoint = torch.load(args.ckpt_path, map_location=device)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except Exception as e:
+        print(f"Warning: Strict loading failed ({e}). Trying strict=False...")
+        model.load_state_dict(state_dict, strict=False)
         
-        self.use_transformer = use_transformer
-        self.use_cbam = use_cbam
-        self.use_aspp = use_aspp
+    model.eval()
 
-        # --- Main Branch (置信度生成分支) ---
-        self.main_conv1 = nn.Conv2d(12, 128, 7, 1, 3)
-        self.main_conv2 = nn.Conv2d(128, 128, 5, 1, 2)
-        self.main_conv3 = nn.Conv2d(128, 128, 3, 1, 1)
-        self.main_conv4 = nn.Conv2d(128, 64, 1, 1, 0)
+    image_paths = resolve_input_path(args.input_path)
+    if len(image_paths) == 0:
+        print(f"No images found in {args.input_path}.")
+        return
 
-        # [模块 1]: 全局-局部联合感知模块
-        if self.use_transformer:
-            self.transformer = TransformerBottleneck(in_channels=64)
-        
-        if self.use_cbam:
-            self.cbam = CBAM(in_planes=64)
+    print(f"Found {len(image_paths)} images to process.")
+    MAX_SIZE = 1024
 
-        self.main_conv5 = nn.Conv2d(64, 64, 7, 1, 3)
-        self.main_conv6 = nn.Conv2d(64, 64, 5, 1, 2)
-        self.main_conv7 = nn.Conv2d(64, 64, 3, 1, 1)
-        self.main_conv8 = nn.Conv2d(64, 3, 3, 1, 1)
+    with torch.no_grad():
+        for i, img_path in enumerate(image_paths):
+            fname = os.path.basename(img_path)
+            raw, wb, ce, gc, h, w = preprocess_image(img_path, max_size=MAX_SIZE)
+            if raw is None: continue
 
-        # --- Refinement Branches (细化分支) ---
-        self.wb_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
-        self.ce_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
-        self.gc_conv1 = nn.Conv2d(6, 32, 7, 1, 3)
+            raw, wb, ce, gc = raw.to(device), wb.to(device), ce.to(device), gc.to(device)
 
-        # [模块 2]: 多尺度特征细化
-        if self.use_aspp:
-            self.wb_refine = ASPP(32, 32)
-            self.ce_refine = ASPP(32, 32)
-            self.gc_refine = ASPP(32, 32)
-        else:
-            self.wb_refine = nn.Conv2d(32, 32, 3, 1, 1)
-            self.ce_refine = nn.Conv2d(32, 32, 3, 1, 1)
-            self.gc_refine = nn.Conv2d(32, 32, 3, 1, 1)
+            raw_padded = pad_to_multiple(raw, multiple=16)
+            wb_padded = pad_to_multiple(wb, multiple=16)
+            ce_padded = pad_to_multiple(ce, multiple=16)
+            gc_padded = pad_to_multiple(gc, multiple=16)
 
-        self.wb_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
-        self.ce_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
-        self.gc_conv3 = nn.Conv2d(32, 3, 3, 1, 1)
+            output = model(raw_padded, wb_padded, ce_padded, gc_padded)
+            output = output[:, :, :h, :w]
 
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
+            out_tensor = output.squeeze().permute(1, 2, 0).cpu().numpy()
+            out_img = np.clip(out_tensor * 255.0, 0, 255).astype(np.uint8)
+            out_img = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
 
-    def forward(self, raw, wb, ce, gc):
-        # 1. Main Branch
-        cat_main = torch.cat([raw, wb, ce, gc], dim=1)
-        
-        m = self.relu(self.main_conv1(cat_main))
-        m = self.relu(self.main_conv2(m))
-        m = self.relu(self.main_conv3(m))
-        m = self.relu(self.main_conv4(m))
+            save_path = os.path.join(args.output_dir, fname)
+            cv2.imwrite(save_path, out_img)
 
-        # --- 执行联合感知模块 ---
-        if self.use_transformer:
-            m = self.transformer(m)
-        
-        if self.use_cbam:
-            m = self.cbam(m)
-        # -----------------------
+            if (i + 1) % 10 == 0:
+                print(f"[{i + 1}/{len(image_paths)}] Processed: {fname}")
 
-        m = self.relu(self.main_conv5(m))
-        m = self.relu(self.main_conv6(m))
-        m = self.relu(self.main_conv7(m))
+    print(f"Done! Results saved to {args.output_dir}")
 
-        weights = self.sigmoid(self.main_conv8(m))
-        w_wb, w_ce, w_gc = torch.split(weights, 1, dim=1)
-
-        # 2. Refinement Branches
-        # WB
-        cat_wb = torch.cat([raw, wb], dim=1)
-        r_wb = self.relu(self.wb_conv1(cat_wb))
-        r_wb = self.wb_refine(r_wb) 
-        r_wb = self.relu(self.wb_conv3(r_wb))
-
-        # CE
-        cat_ce = torch.cat([raw, ce], dim=1)
-        r_ce = self.relu(self.ce_conv1(cat_ce))
-        r_ce = self.ce_refine(r_ce)
-        r_ce = self.relu(self.ce_conv3(r_ce))
-
-        # GC
-        cat_gc = torch.cat([raw, gc], dim=1)
-        r_gc = self.relu(self.gc_conv1(cat_gc))
-        r_gc = self.gc_refine(r_gc)
-        r_gc = self.relu(self.gc_conv3(r_gc))
-
-        # 3. Fusion
-        out = r_wb * w_wb + r_ce * w_ce + r_gc * w_gc
-
-        return out
 
 if __name__ == '__main__':
-    model = ImprovedWaterNet()
-    dummy = torch.randn(1, 3, 256, 256)
-    print("Model initialized successfully.")
+    parser = argparse.ArgumentParser(description='ImprovedWaterNet Inference')
+    parser.add_argument('--input_path', type=str, default=r'C:\Users\Administrator\Desktop\cv\WaterNet-refine\DATA_UIEB_mine\test\raw', help='Dataset root')
+    parser.add_argument('--ckpt_path', type=str, default=r'C:\Users\Administrator\Desktop\cv\WaterNet-refine\checkpoints\ImprovedWaterNet_best.pth', help='Path to .pth file')
+    parser.add_argument('--output_dir', type=str, default='results', help='Output folder')
+    args = parser.parse_args()
+    run_inference(args)
