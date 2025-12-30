@@ -112,36 +112,10 @@ def run_inference(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # --- 1. 确定模型配置 ---
-    use_transformer = True
-    use_cbam = True
-    use_aspp = True
-    
-    if args.no_perception:
-        use_transformer = False
-        use_cbam = False
-        print(">> Mode: Ablation (No Perception Module)")
-    
-    if args.no_aspp:
-        use_aspp = False
-        print(">> Mode: Ablation (No ASPP)")
-
-    print("="*40)
-    print(f"Inference Configuration:")
-    print(f"  Transformer : {use_transformer}")
-    print(f"  CBAM        : {use_cbam}")
-    print(f"  ASPP        : {use_aspp}")
-    print(f"  Checkpoint  : {args.ckpt_path}")
-    print("="*40)
-
     os.makedirs(args.output_dir, exist_ok=True)
 
     # --- 2. 实例化模型 ---
-    model = ImprovedWaterNet(
-        use_transformer=use_transformer,
-        use_cbam=use_cbam,
-        use_aspp=use_aspp
-    ).to(device)
+    model = ImprovedWaterNet().to(device)
     
     print(f"Loading weights from {args.ckpt_path}...")
     checkpoint = torch.load(args.ckpt_path, map_location=device)
@@ -194,13 +168,8 @@ def run_inference(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ImprovedWaterNet Inference')
-    parser.add_argument('--input_path', type=str, default='DATA_UIEB_mine/test/raw', help='Dataset root')
-    parser.add_argument('--ckpt_path', type=str, required=True, help='Path to .pth file')
+    parser.add_argument('--input_path', type=str, default=r'WaterNet-refineDATA_UIEB_mine\test\raw', help='Dataset root')
+    parser.add_argument('--ckpt_path', type=str, default=r'WaterNet-refine\checkpoints\ImprovedWaterNet_best.pth', help='Path to .pth file')
     parser.add_argument('--output_dir', type=str, default='results', help='Output folder')
-    
-    # 消融开关
-    parser.add_argument('--no_perception', action='store_true', help='Disable Trans+CBAM')
-    parser.add_argument('--no_aspp', action='store_true', help='Disable ASPP')
-    
     args = parser.parse_args()
     run_inference(args)
