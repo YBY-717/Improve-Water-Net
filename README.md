@@ -22,7 +22,7 @@ https://li-chongyi.github.io/proj_benchmark.html
 ## Training
 1.克隆仓库 <br>
 2.通过文件夹中的generate_training_data.py和generate_validation_data.py生成预处理数据 <br>
-3.将训练数据放入相应文件夹。目录结构data_UIEB文件夹下应该包含train和val（train和val文件夹应该包含Ground Truth图像gt_train、直方图均衡化图像input_ce_train、伽马校正图像input_gc_train、白平衡图像input_wb_train和原始图像input_train） <br>
+3.将训练数据放入相应文件夹。目录结构data_UIEB文件夹下应该包含train和val（train文件夹应该包含Ground Truth图像gt_train、直方图均衡化图像input_ce_train、伽马校正图像input_gc_train、白平衡图像input_wb_train和原始图像input_train；val文件夹同理） <br>
 4.执行models/train.py <br>
 5.在checkpoint中找到检查点
 
